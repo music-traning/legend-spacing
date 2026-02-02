@@ -4,7 +4,7 @@ import { getWalkingBassLine } from '../utils/bassLogic';
 import { transposeChordName } from '../utils/musicUtils';
 
 const LOOKAHEAD = 25.0; // ms
-const SCHEDULE_AHEAD_TIME = 0.2; // secons
+const SCHEDULE_AHEAD_TIME = 0.2; // seconds
 
 export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, loopEnd, isLooping }) => {
     const [isPlaying, setIsPlaying] = useState(false);
@@ -15,9 +15,16 @@ export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, 
 
     const audioCtxRef = useRef(null);
     const timerIDRef = useRef(null);
+    const rafIDRef = useRef(null);
+
+    // Audio Scheduling State (The "Audio Thread" Truth)
     const nextNoteTimeRef = useRef(0.0);
     const currentNoteIndexRef = useRef(0);
     const lastAvgFretRef = useRef(5);
+
+    // Visual Sync Queue
+    // Stores events: { time: number, index: number, chordData: { chord, frets } }
+    const visualQueueRef = useRef([]);
 
     // Keep latest settings accessible to the scheduler without closures
     const settingsRef = useRef({ song, bpm, style, transpose, mixer, loopStart, loopEnd, isLooping });
@@ -26,28 +33,62 @@ export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, 
         settingsRef.current = { song, bpm, style, transpose, mixer, loopStart, loopEnd, isLooping };
     }, [song, bpm, style, transpose, mixer, loopStart, loopEnd, isLooping]);
 
-    // Initialize AudioContext
+    // Initialize AudioContext safely
     const initAudio = () => {
-        if (!audioCtxRef.current) {
-            audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        if (audioCtxRef.current.state === 'suspended') {
-            audioCtxRef.current.resume();
+        try {
+            if (!audioCtxRef.current) {
+                const CtxClass = window.AudioContext || window.webkitAudioContext;
+                if (!CtxClass) throw new Error("AudioContext not supported");
+                audioCtxRef.current = new CtxClass();
+            }
+            if (audioCtxRef.current.state === 'suspended') {
+                audioCtxRef.current.resume();
+            }
+        } catch (e) {
+            console.error("Failed to initialize AudioContext:", e);
         }
     };
 
-    // SCHEDULER
+    // --- ANIMATION FRAME LOOP (UI SYNC) ---
+    const uiLoop = useCallback(() => {
+        if (!audioCtxRef.current) return;
+        const currentTime = audioCtxRef.current.currentTime;
+        const queue = visualQueueRef.current;
+
+        // Process all events that are due (or overdue)
+        // We peek at the head of the queue
+        while (queue.length > 0 && queue[0].time <= currentTime + 0.05) { // Small buffer for smoothness
+            const event = queue.shift();
+
+            // Only update if it's a new index or data to avoid React render thrashing
+            // But we trust the queue is sparse (once per chord)
+            setCurrentIdx(event.index);
+            setCurrentChordData(event.chordData);
+        }
+
+        rafIDRef.current = requestAnimationFrame(uiLoop);
+    }, []);
+
+    // Start/Stop UI Loop based on playing state
+    useEffect(() => {
+        if (isPlaying) {
+            rafIDRef.current = requestAnimationFrame(uiLoop);
+        } else {
+            if (rafIDRef.current) cancelAnimationFrame(rafIDRef.current);
+        }
+        return () => {
+            if (rafIDRef.current) cancelAnimationFrame(rafIDRef.current);
+        };
+    }, [isPlaying, uiLoop]);
+
+
+    // --- SCHEDULER ---
     const nextNote = () => {
         const { song, bpm, loopEnd, loopStart, isLooping } = settingsRef.current;
         const secondsPerBeat = 60.0 / bpm;
 
-        // 1. Advance Index
-        // NOTE: We do not update React state here. We schedule the event.
-        // Logic to calculate Next Index
-        // ... (However, the "currentNoteIndexRef" tracks what is *Being Scheduled*, not what is hearing)
-
         const nextItem = song.progression[currentNoteIndexRef.current];
-        if (!nextItem) return; // Should not happen
+        if (!nextItem) return;
 
         nextNoteTimeRef.current += nextItem.b * secondsPerBeat;
 
@@ -65,11 +106,13 @@ export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, 
     };
 
     const scheduleNote = (beatNumber, time) => {
-        const { song, style, transpose, mixer, loopStart, loopEnd, isLooping } = settingsRef.current;
+        const { song, style, transpose, mixer, loopStart, loopEnd, isLooping, bpm } = settingsRef.current;
 
         // The index we are scheduling NOW
         const idx = currentNoteIndexRef.current;
         const item = song.progression[idx];
+        if (!item) return;
+
         const chordName = transposeChordName(item.c, transpose);
 
         // PREPARE NEXT CHORD Info (For Bass Approach)
@@ -79,102 +122,116 @@ export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, 
         const nextItem = song.progression[nextIdx];
         const nextChordName = transposeChordName(nextItem?.c || "C", transpose);
 
-        // UI SYNC (Schedule React State Update)
-        // We calculate the delay from "Now" to "Scheduled Time"
         const ctx = audioCtxRef.current;
-        // If time is close to now, do it. 
-        // We use requestAnimationFrame or setTimeout to flip the UI at the right moment.
-        // Actually, for React, just settimeout is easiest.
-        const drawTime = (time - ctx.currentTime) * 1000;
-        setTimeout(() => {
-            // Recalculate frets for display (clean syncing)
-            // But we actually need the frets logic for AUDIO too.
-            // Let's do it once? 
-            // We'll trust the logic is deterministic.
 
-            // Wait, we need 'lastAvgFret' for voice leading. 
-            // In a lookahead, 'lastAvgFret' needs to be updated sequentially in the scheduler loop, 
-            // NOT the UI loop, to maintain consistency.
-            // So we handle logic HERE in scheduleNote.
+        // --- 1. CALCULATE DATA & AUDIO ---
+        let finalFrets = [null, null, null, null, null, null];
 
-            // BUT, modifying ref here is tricky if UI also reads it. 
-
-            setCurrentIdx(idx);
-            // We will let the "useEffect" in App.jsx or here handle the voicing calculation for Display?
-            // No, better to pass the calculated frets out.
-            // But "getLegendVoicing" is pure.
-        }, Math.max(0, drawTime));
-
-
-        // --- AUDIO GENERATION ---
-
-        // 1. GUITAR
+        // Guitar Audio & Voice Leading
         if (mixer.guitar) {
-            // Voice Leading State (updated in scheduler sequence)
-            const frets = getLegendVoicing(chordName, style, lastAvgFretRef.current);
-            // Update the Ref for NEXT scheduling step
-            const avg = frets.filter(f => f !== null).reduce((a, b) => a + b, 0) / (frets.filter(f => f !== null).length || 1);
-            if (avg > 0) lastAvgFretRef.current = avg;
-
-            // Trigger Display Update with these EXACT frets
-            setTimeout(() => {
-                setCurrentChordData({ chord: chordName, frets });
-            }, Math.max(0, drawTime));
-
-            playGuitarStrum(ctx, time, frets, style, item.b, bpm);
+            finalFrets = getLegendVoicing(chordName, style, lastAvgFretRef.current);
+            // Update the Ref for NEXT scheduling step (Voice Leading)
+            const active = finalFrets.filter(f => f !== null);
+            if (active.length > 0) {
+                const avg = active.reduce((a, b) => a + b, 0) / active.length;
+                lastAvgFretRef.current = avg;
+            }
+            playGuitarStrum(ctx, time, finalFrets, style, item.b, bpm);
+        } else {
+            // Even if guitar is mute, we might want to calculate visual frets?
+            // Yes, user wants to see what chords are playing.
+            // But if we don't play sound, 'lastAvgFretRef' update is still good for consistency if they unmute.
+            finalFrets = getLegendVoicing(chordName, style, lastAvgFretRef.current);
+            const active = finalFrets.filter(f => f !== null);
+            if (active.length > 0) {
+                const avg = active.reduce((a, b) => a + b, 0) / active.length;
+                lastAvgFretRef.current = avg;
+            }
         }
 
-        // 2. BASS
+        // Bass Audio
         if (mixer.bass) {
             const bassLine = getWalkingBassLine(chordName, nextChordName, item.b);
             playBassLine(ctx, time, bassLine, item.b, bpm);
         }
 
-        // 3. CLICK
+        // Click Audio
         if (mixer.click) {
             playClick(ctx, time, item.b, bpm, mixer.clickOffBeat);
         }
+
+        // --- 2. ENQUEUE VISUALS ---
+        // We push this event to the queue so the UI updates exactly when 'time' arrives
+        visualQueueRef.current.push({
+            time: time,
+            index: idx,
+            chordData: { chord: chordName, frets: finalFrets }
+        });
     };
 
     const scheduler = () => {
+        if (!audioCtxRef.current) return;
         // While there are notes that will play within the scheduleAheadTime...
-        while (nextNoteTimeRef.current < audioCtxRef.current.currentTime + SCHEDULE_AHEAD_TIME) {
+        // Safety break to prevent infinite loops if something goes wrong
+        let iterations = 0;
+        while (nextNoteTimeRef.current < audioCtxRef.current.currentTime + SCHEDULE_AHEAD_TIME && iterations < 100) {
             scheduleNote(currentNoteIndexRef.current, nextNoteTimeRef.current);
             nextNote();
+            iterations++;
         }
         timerIDRef.current = window.setTimeout(scheduler, LOOKAHEAD);
     };
 
-    // --- CONTOLS ---
+    // --- CONTROLS ---
     const togglePlay = useCallback(() => {
         initAudio();
         if (isPlaying) {
+            // PAUSE
             setIsPlaying(false);
             if (timerIDRef.current) clearTimeout(timerIDRef.current);
             return;
         }
 
+        // PLAY
         setIsPlaying(true);
-        currentNoteIndexRef.current = currentIdx; // Resume from UI slider pos
-        nextNoteTimeRef.current = audioCtxRef.current.currentTime + 0.1; // Start slightly ahead
+        // Resume from current visual index
+        currentNoteIndexRef.current = currentIdx;
+
+        // Reset timing to now
+        if (audioCtxRef.current) {
+            nextNoteTimeRef.current = audioCtxRef.current.currentTime + 0.1;
+        }
+
+        // Clear old visuals from queue (stale)
+        visualQueueRef.current = [];
+
         scheduler();
     }, [isPlaying, currentIdx]);
 
     const seek = (idx) => {
-        setCurrentIdx(idx);
-        currentNoteIndexRef.current = idx;
-
-        // Update display manually immediately so it feels responsive
         const { song, style, transpose } = settingsRef.current;
+        if (!song.progression[idx]) return;
+
+        // 1. Update State immediately for responsiveness
+        setCurrentIdx(idx);
+
+        // 2. Calculate Visuals for the seek point (immediate feedback)
+        // Reset Voice Leading to center of board for a fresh seek
+        lastAvgFretRef.current = 5;
+
         const item = song.progression[idx];
         const cName = transposeChordName(item.c, transpose);
         const frets = getLegendVoicing(cName, style, lastAvgFretRef.current);
         setCurrentChordData({ chord: cName, frets });
 
-        // If playing, the scheduler will pick up from currentNoteIndexRef automatically
-        // But nextNoteTime needs to be reset to "Now" to avoid playing catchup?
-        if (isPlaying) {
+        // 3. Update Audio Thread State
+        currentNoteIndexRef.current = idx;
+        visualQueueRef.current = []; // Clear pending
+
+        if (isPlaying && audioCtxRef.current) {
+            // Retarget scheduler
             nextNoteTimeRef.current = audioCtxRef.current.currentTime + 0.1;
+            // The scheduler loop is running (via setTimeout), it will pick up the new index/time on next tick
         }
     };
 
@@ -182,6 +239,7 @@ export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, 
     useEffect(() => {
         return () => {
             if (timerIDRef.current) clearTimeout(timerIDRef.current);
+            if (rafIDRef.current) cancelAnimationFrame(rafIDRef.current);
             if (audioCtxRef.current) audioCtxRef.current.close();
         }
     }, []);
@@ -199,8 +257,9 @@ export const useAudioEngine = ({ song, bpm, style, transpose, mixer, loopStart, 
 
 const playGuitarStrum = (ctx, time, frets, style, beats, bpm) => {
     const baseFreqs = [82.41, 110.0, 146.83, 196.0, 246.94, 329.63];
-    const strumDelay = 0.025; // slightly faster strum
+    const strumDelay = 0.025;
     const beatLen = 60 / bpm;
+    // slightly shorter duration to allow clean cut? or standard.
     const duration = beatLen * beats;
 
     frets.forEach((f, i) => {
@@ -210,11 +269,11 @@ const playGuitarStrum = (ctx, time, frets, style, beats, bpm) => {
 
             // Tone Shaping
             if (style.includes("wes") || style.includes("pat") || style.includes("metheny")) {
-                osc.type = 'sine'; // Darker
+                osc.type = 'sine';
             } else if (style.includes("jim_hall") || style.includes("evans")) {
-                osc.type = 'triangle'; // Warm
+                osc.type = 'triangle';
             } else {
-                osc.type = 'triangle'; // standard jazz
+                osc.type = 'triangle';
             }
 
             const freq = baseFreqs[i] * Math.pow(2, f / 12);
@@ -222,14 +281,25 @@ const playGuitarStrum = (ctx, time, frets, style, beats, bpm) => {
 
             const t = time + (i * strumDelay);
 
+            // Envelope
             g.gain.setValueAtTime(0, t);
-            g.gain.linearRampToValueAtTime(0.15, t + 0.02); // Attack
-            g.gain.exponentialRampToValueAtTime(0.001, t + (duration * 0.95)); // Decay almost to silence
-            g.gain.linearRampToValueAtTime(0, t + duration); // Ensure absolute 0 to prevent click
+            g.gain.linearRampToValueAtTime(0.15, t + 0.02);
+            g.gain.exponentialRampToValueAtTime(0.001, t + (duration * 0.95));
+            g.gain.linearRampToValueAtTime(0, t + duration);
 
             osc.connect(g).connect(ctx.destination);
             osc.start(t);
-            osc.stop(t + duration + 0.1); // Stop with safety margin
+            osc.stop(t + duration + 0.1);
+
+            // Explicit cleanup for garbage collection
+            osc.onended = () => {
+                try {
+                    osc.disconnect();
+                    g.disconnect();
+                } catch (e) {
+                    // Ignore already disconnected errors
+                }
+            };
         }
     });
 };
@@ -245,7 +315,6 @@ const playBassLine = (ctx, time, bassLine, beats, bpm) => {
         osc.type = 'triangle';
         osc.frequency.value = noteObj.freq;
 
-        // Low Pass Filter for Bass Warmth
         const filter = ctx.createBiquadFilter();
         filter.type = 'lowpass';
         filter.frequency.setValueAtTime(600, t);
@@ -258,6 +327,14 @@ const playBassLine = (ctx, time, bassLine, beats, bpm) => {
         osc.connect(filter).connect(g).connect(ctx.destination);
         osc.start(t);
         osc.stop(t + beatLen);
+
+        osc.onended = () => {
+            try {
+                osc.disconnect();
+                filter.disconnect();
+                g.disconnect();
+            } catch (e) { }
+        };
     });
 };
 
@@ -268,11 +345,8 @@ const playClick = (ctx, time, beats, bpm, clickOffBeat) => {
         let isStrong = (i === 0);
 
         if (clickOffBeat) {
-            // 2 & 4 means beats 1 (index 0) is silent? No, beat 2 (index 1) and 4 (index 3).
-            // Indices: 0, 1, 2, 3.
-            // 2 & 4 are indices 1 and 3.
             if (i % 2 === 0) play = false;
-            isStrong = true; // Make the offbeats strong clicks
+            isStrong = true;
         }
 
         if (play) {
@@ -282,10 +356,17 @@ const playClick = (ctx, time, beats, bpm, clickOffBeat) => {
             osc.frequency.value = isStrong ? 1000 : 800;
             osc.type = 'square';
             g.gain.setValueAtTime(0.05, t);
-            g.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.05); // Short click
             osc.connect(g).connect(ctx.destination);
             osc.start(t);
             osc.stop(t + 0.1);
+
+            osc.onended = () => {
+                try {
+                    osc.disconnect();
+                    g.disconnect();
+                } catch (e) { }
+            };
         }
     }
 };
