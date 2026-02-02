@@ -1,0 +1,24 @@
+{
+  "autumn_leaves": {
+    "title": "Autumn Leaves",
+    "progression": ["Am7", "D7", "Gmaj7", "Cmaj7", "F#m7b5", "B7", "Em7", "Em7"],
+    "bpm": 120
+  },
+  "blue_bossa": {
+    "title": "Blue Bossa",
+    "progression": ["Cm7", "Cm7", "Fm7", "Fm7", "Dm7b5", "G7alt", "Cm7", "Cm7"],
+    "bpm": 140
+  },
+  "fly_me_to_the_moon": {
+    "title": "Fly Me to the Moon",
+    "progression": ["Am7", "Dm7", "G7", "Cmaj7", "Fmaj7", "Bm7b5", "E7", "Am7"],
+    "bpm": 130
+  },
+  "all_the_things": { "title": "All The Things You Are", "progression": ["Fm7", "Bbm7", "Eb7", "Abmaj7", "Dbmaj7", "D7", "Gmaj7", "Gmaj7"] },
+  "c_jam_blues": { "title": "C Jam Blues", "progression": ["C7", "C7", "C7", "C7", "F7", "F7", "C7", "C7", "G7", "F7", "C7", "G7"] },
+  "summertime": { "title": "Summertime", "progression": ["Am6", "Bm7b5", "E7alt", "Am6", "Dm7", "Dm7", "Bb9", "E7alt"] },
+  "take_the_a_train": { "title": "Take the A Train", "progression": ["Cmaj7", "Cmaj7", "D7b5", "D7b5", "Dm7", "G7", "Cmaj7", "Dm7"] },
+  "days_of_wine": { "title": "The Days of Wine and Roses", "progression": ["Fmaj7", "Eb7", "D7alt", "D7alt", "Gm7", "Bbm7", "Fmaj7", "Am7"] },
+  "satin_doll": { "title": "Satin Doll", "progression": ["Dm7", "G7", "Dm7", "G7", "Em7", "A7", "Em7", "A7"] },
+  "another_you": { "title": "There Will Never Be Another You", "progression": ["Ebmaj7", "Ebmaj7", "Dm7b5", "G7alt", "Cm7", "Cm7", "Bbm7", "Eb7"] }
+}
